@@ -1,0 +1,5 @@
+flask
+anthropic
+stripe
+resend
+gunicorn
