@@ -419,6 +419,35 @@ def stats():
     })
 
 
+@app.route("/stats/detail", methods=["GET"])
+def stats_detail():
+    """Row-by-row view of every email sent — for actual analysis, not
+    just the summary numbers. Visit as: yoururl.com/stats/detail?key=YOUR_SECRET_KEY"""
+    if STATS_ACCESS_KEY:
+        provided_key = request.args.get("key", "")
+        if provided_key != STATS_ACCESS_KEY:
+            return jsonify({"error": "unauthorized"}), 403
+
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM sent_emails ORDER BY sent_at DESC LIMIT 200").fetchall()
+    conn.close()
+
+    return jsonify({
+        "rows": [
+            {
+                "invoice_id": r[0],
+                "attempt": r[1],
+                "customer_email": r[2],
+                "amount": r[3],
+                "currency": r[4],
+                "sent_at": r[5],
+                "recovered": bool(r[6]),
+            }
+            for r in rows
+        ]
+    })
+
+
 @app.route("/", methods=["GET"])
 def health_check():
     return jsonify({
