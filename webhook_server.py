@@ -259,7 +259,7 @@ def generate_recovery_email(customer_name: str, amount_display: str, attempt: in
 
     try:
         response = anthropic_client.messages.create(
-            model=MODEL, max_tokens=250, system=system_prompt,
+            model=MODEL, max_tokens=500, system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         )
         raw = "".join(b.text for b in response.content if b.type == "text")
