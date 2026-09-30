@@ -96,6 +96,7 @@ BUSINESS = {
 # use it so tracking data survives redeploys. Falls back to local (ephemeral)
 # storage if no disk is attached — still fine for a pilot, just resets on redeploy.
 DB_PATH = "/data/tracking.db" if os.path.isdir("/data") else "tracking.db"
+print(f"Using database path: {DB_PATH} (persistent disk: {'YES' if DB_PATH.startswith('/data') else 'NO — data will reset on redeploy'})")
 
 
 def get_db():
@@ -585,6 +586,8 @@ def health_check():
         "status": "running",
         "business": BUSINESS["name"],
         "category": BUSINESS["category"],
+        "db_path": DB_PATH,
+        "persistent_disk": DB_PATH.startswith("/data"),
     }), 200
 
 
