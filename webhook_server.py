@@ -295,6 +295,7 @@ def wrap_in_html_email(parsed: dict, cta_link: str) -> str:
 <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px 0;">{parsed['header']}</h1>
 <p style="font-size:16px;line-height:1.6;color:#374151;margin:0 0 28px 0;">{parsed['body']}</p>
 <a href="{cta_link}" style="display:inline-block;background:#111827;color:#fff;text-decoration:none;font-weight:600;font-size:15px;padding:14px 32px;border-radius:8px;">{parsed['button']}</a>
+<p style="font-size:13px;color:#9ca3af;margin:24px 0 0 0;">Questions? Just reply to this email.</p>
 </td></tr></table></td></tr></table></body></html>"""
 
 
