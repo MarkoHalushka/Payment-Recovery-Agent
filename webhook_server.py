@@ -37,6 +37,7 @@ KNOWN LIMITATIONS — read before connecting a real client
 
 import os
 import sys
+import html
 import sqlite3
 import stripe
 import resend
@@ -91,7 +92,10 @@ BUSINESS = {
 # =======================================================================
 # TRACKING DATABASE — idempotency + basic reporting
 # =======================================================================
-DB_PATH = "tracking.db"
+# If a persistent disk is mounted at /data (see Render's Disk settings),
+# use it so tracking data survives redeploys. Falls back to local (ephemeral)
+# storage if no disk is attached — still fine for a pilot, just resets on redeploy.
+DB_PATH = "/data/tracking.db" if os.path.isdir("/data") else "tracking.db"
 
 
 def get_db():
@@ -284,17 +288,30 @@ def generate_recovery_email(customer_name: str, amount_display: str, attempt: in
 
 
 def wrap_in_html_email(parsed: dict, cta_link: str) -> str:
+    # SECURITY: escape everything that ultimately traces back to
+    # user-influenced data (customer name flows into the AI prompt and
+    # could theoretically be echoed back; the AI output itself is also
+    # not something to trust blindly) before inserting into raw HTML.
+    header = html.escape(parsed['header'])
+    body = html.escape(parsed['body'])
+    button = html.escape(parsed['button'])
+    business_name = html.escape(BUSINESS['name'])
+    # cta_link comes from Stripe's own hosted_invoice_url (or our fixed
+    # fallback) — not free-text, but escaping costs nothing and adds a
+    # layer of defense regardless.
+    safe_link = html.escape(cta_link, quote=True)
+
     return f"""<!DOCTYPE html><html><body style="margin:0;padding:0;background:#f4f4f7;font-family:-apple-system,Helvetica,Arial,sans-serif;">
 <table width="100%"><tr><td align="center" style="padding:40px 20px;">
 <table width="480" style="background:#fff;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,0.06);">
 <tr><td style="padding:32px 32px 0 32px;text-align:center;">
-<div style="font-size:15px;font-weight:700;letter-spacing:0.02em;color:#6b7280;text-transform:uppercase;">{BUSINESS['name']}</div>
+<div style="font-size:15px;font-weight:700;letter-spacing:0.02em;color:#6b7280;text-transform:uppercase;">{business_name}</div>
 <div style="height:1px;background:#e5e7eb;margin:20px 0 0 0;"></div>
 </td></tr>
 <tr><td style="padding:32px 32px 40px 32px;text-align:center;">
-<h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px 0;">{parsed['header']}</h1>
-<p style="font-size:16px;line-height:1.6;color:#374151;margin:0 0 28px 0;">{parsed['body']}</p>
-<a href="{cta_link}" style="display:inline-block;background:#111827;color:#fff;text-decoration:none;font-weight:600;font-size:15px;padding:14px 32px;border-radius:8px;">{parsed['button']}</a>
+<h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px 0;">{header}</h1>
+<p style="font-size:16px;line-height:1.6;color:#374151;margin:0 0 28px 0;">{body}</p>
+<a href="{safe_link}" style="display:inline-block;background:#111827;color:#fff;text-decoration:none;font-weight:600;font-size:15px;padding:14px 32px;border-radius:8px;">{button}</a>
 <p style="font-size:13px;color:#9ca3af;margin:24px 0 0 0;">Questions? Just reply to this email.</p>
 </td></tr></table></td></tr></table></body></html>"""
 
@@ -330,27 +347,38 @@ def stripe_webhook():
     # --- SECURITY: verify this request genuinely came from Stripe ---
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
-        # FIX: newer stripe-python returns a StripeObject, not a plain dict —
-        # .get() doesn't work the same way on it. Convert once, here, so
-        # every .get() call below (event, invoice, etc.) works as expected.
-        event = event.to_dict()
     except (ValueError, stripe.error.SignatureVerificationError) as e:
         print(f"WARNING: rejected webhook with invalid signature: {e}")
         return jsonify({"error": "invalid signature"}), 400
 
     try:
+        # FIX: newer stripe-python returns a StripeObject, not a plain dict —
+        # .get() doesn't work the same way on it. Convert once, here, so
+        # every .get() call below (event, invoice, etc.) works as expected.
+        # Wrapped in its own try so a conversion failure is handled the
+        # same clean way as any other processing error, not left to crash.
+        event = event.to_dict()
+    except Exception as e:
+        print(f"ERROR: could not convert event to dict: {e}")
+        return jsonify({"error": "malformed event"}), 500
+
+    try:
         if event["type"] == "invoice.payment_failed":
             invoice = event["data"]["object"]
-            invoice_id = invoice.get("id", "unknown")
+            # Using `or` (not just .get(key, default)) handles BOTH a
+            # missing key AND a key explicitly present but null — Stripe
+            # payloads can do either, and .get()'s default only covers
+            # the first case.
+            invoice_id = invoice.get("id") or "unknown"
 
             # Skip anything with no real amount owed (e.g. $0 invoices,
             # already-voided invoices that still fire this event type).
-            amount_due_cents = invoice.get("amount_due", 0)
+            amount_due_cents = invoice.get("amount_due") or 0
             if amount_due_cents <= 0:
                 print(f"Skipping invoice {invoice_id} — amount_due is 0.")
                 return jsonify({"received": True, "skipped": "zero_amount"}), 200
 
-            attempt = invoice.get("attempt_count", 1)
+            attempt = invoice.get("attempt_count") or 1
 
             # --- IDEMPOTENCY: don't resend for the same invoice+attempt.
             # Stripe guarantees at-least-once delivery, so duplicates are
@@ -365,11 +393,19 @@ def stripe_webhook():
                 print(f"WARNING: no email found for invoice {invoice_id}, customer {invoice.get('customer')} — cannot send.")
                 return jsonify({"received": True, "skipped": "no_email"}), 200
 
-            currency = invoice.get("currency", "usd")
+            currency = invoice.get("currency") or "usd"
             amount_display = format_amount(amount_due_cents, currency)
 
             email_content = generate_recovery_email(customer_name, amount_display, attempt)
-            update_link = invoice.get("hosted_invoice_url") or "https://example.com/update-card"
+
+            update_link = invoice.get("hosted_invoice_url")
+            if not update_link:
+                # This should be rare, but a customer must NEVER silently
+                # receive a dead link — log loudly so this is visible,
+                # not just swallowed.
+                print(f"WARNING: no hosted_invoice_url for invoice {invoice_id} — using fallback link.")
+                update_link = "https://example.com/update-card"
+
             html_body = wrap_in_html_email(email_content, update_link)
 
             sent_ok = send_email(customer_email, email_content["subject"], html_body)
@@ -384,7 +420,7 @@ def stripe_webhook():
                 return jsonify({"error": "email send failed"}), 500
 
         elif event["type"] == "invoice.paid":
-            invoice_id = event["data"]["object"].get("id", "unknown")
+            invoice_id = event["data"]["object"].get("id") or "unknown"
             mark_recovered(invoice_id)
             print(f"Payment recovered for invoice {invoice_id}")
 
@@ -451,6 +487,96 @@ def stats_detail():
             for r in rows
         ]
     })
+
+
+@app.route("/dashboard", methods=["GET"])
+def dashboard():
+    """A real, styled visual report of the live tracking data —
+    same numbers as /stats, presented as something worth sharing."""
+    if STATS_ACCESS_KEY:
+        provided_key = request.args.get("key", "")
+        if provided_key != STATS_ACCESS_KEY:
+            return "Unauthorized. Add ?key=YOUR_SECRET to the URL.", 403
+
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM sent_emails ORDER BY sent_at DESC").fetchall()
+    conn.close()
+
+    total_sent = len(rows)
+    total_recovered = sum(1 for r in rows if r[6] == 1)
+    total_recovered_amount = sum(r[3] for r in rows if r[6] == 1)
+    conversion_rate = (total_recovered / total_sent * 100) if total_sent else 0
+    fee = total_recovered_amount * 0.12
+
+    table_rows = ""
+    for r in rows:
+        invoice_id, attempt, customer_email, amount, currency, sent_at, recovered = r
+        status_badge = (
+            '<span style="background:#d1fae5;color:#065f46;padding:4px 10px;border-radius:20px;font-size:12px;font-weight:600;">Recovered</span>'
+            if recovered
+            else '<span style="background:#fef3c7;color:#92400e;padding:4px 10px;border-radius:20px;font-size:12px;font-weight:600;">Pending</span>'
+        )
+        safe_email = html.escape(customer_email or "—")
+        table_rows += f"""
+        <tr style="border-bottom:1px solid #e5e7eb;">
+            <td style="padding:12px 16px;font-size:13px;color:#6b7280;">{html.escape(sent_at or '')}</td>
+            <td style="padding:12px 16px;font-size:14px;">{safe_email}</td>
+            <td style="padding:12px 16px;font-size:13px;color:#6b7280;">Attempt {attempt}</td>
+            <td style="padding:12px 16px;font-size:14px;font-weight:600;">{amount:.2f} {currency.upper()}</td>
+            <td style="padding:12px 16px;">{status_badge}</td>
+        </tr>"""
+
+    if not rows:
+        table_rows = '<tr><td colspan="5" style="padding:32px;text-align:center;color:#9ca3af;">No data yet.</td></tr>'
+    else:
+        table_rows += f"""
+        <tr style="background:#f9fafb;border-top:2px solid #e5e7eb;">
+            <td colspan="3" style="padding:16px;font-size:13px;font-weight:600;color:#374151;text-align:right;">Total Recovered:</td>
+            <td style="padding:16px;font-size:15px;font-weight:700;">${total_recovered_amount:.2f}</td>
+            <td></td>
+        </tr>
+        <tr style="background:#f9fafb;">
+            <td colspan="3" style="padding:16px;font-size:13px;font-weight:600;color:#374151;text-align:right;">Fee Owed (12%):</td>
+            <td style="padding:16px;font-size:15px;font-weight:700;color:#b45309;">${fee:.2f}</td>
+            <td></td>
+        </tr>"""
+
+    html_page = f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8">
+<title>{html.escape(BUSINESS['name'])} — Payment Recovery Report</title>
+<style>
+  body {{ font-family: -apple-system, Helvetica, Arial, sans-serif; background: #f4f4f7; margin: 0; padding: 40px 20px; color: #111827; }}
+  .wrap {{ max-width: 900px; margin: 0 auto; }}
+  h1 {{ font-size: 22px; margin: 0 0 4px 0; }}
+  .subtitle {{ color: #6b7280; font-size: 14px; margin: 0 0 32px 0; }}
+  .cards {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 32px; }}
+  .card {{ background: #fff; border-radius: 10px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }}
+  .card .label {{ font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 8px; }}
+  .card .value {{ font-size: 24px; font-weight: 700; }}
+  table {{ width: 100%; background: #fff; border-radius: 10px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.06); border-collapse: collapse; }}
+  th {{ text-align: left; padding: 12px 16px; font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.03em; border-bottom: 2px solid #e5e7eb; }}
+  @media (max-width: 640px) {{ .cards {{ grid-template-columns: 1fr 1fr; }} }}
+</style></head>
+<body>
+<div class="wrap">
+    <h1>{html.escape(BUSINESS['name'])} — Payment Recovery Report</h1>
+    <p class="subtitle">Live data, updated in real time</p>
+
+    <div class="cards">
+        <div class="card"><div class="label">Emails Sent</div><div class="value">{total_sent}</div></div>
+        <div class="card"><div class="label">Recovered</div><div class="value">{total_recovered}</div></div>
+        <div class="card"><div class="label">Conversion</div><div class="value">{conversion_rate:.1f}%</div></div>
+        <div class="card"><div class="label">Recovered Amount</div><div class="value">${total_recovered_amount:.2f}</div></div>
+    </div>
+
+    <table>
+        <thead><tr><th>Sent</th><th>Customer</th><th>Attempt</th><th>Amount</th><th>Status</th></tr></thead>
+        <tbody>{table_rows}</tbody>
+    </table>
+</div>
+</body></html>"""
+
+    return html_page
 
 
 @app.route("/", methods=["GET"])
