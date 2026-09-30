@@ -330,6 +330,10 @@ def stripe_webhook():
     # --- SECURITY: verify this request genuinely came from Stripe ---
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+        # FIX: newer stripe-python returns a StripeObject, not a plain dict —
+        # .get() doesn't work the same way on it. Convert once, here, so
+        # every .get() call below (event, invoice, etc.) works as expected.
+        event = event.to_dict()
     except (ValueError, stripe.error.SignatureVerificationError) as e:
         print(f"WARNING: rejected webhook with invalid signature: {e}")
         return jsonify({"error": "invalid signature"}), 400
